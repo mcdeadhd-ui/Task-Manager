@@ -15,8 +15,14 @@
         <option value="dark" {{ 'selected' if user['theme_mode'] == 'dark' else '' }}>Dark</option>
       </select>
     </label>
+    <label>Taskkarten im Dashboard
+      <select name="card_view_mode" required>
+        <option value="compact" {{ 'selected' if user['card_view_mode'] == 'compact' else '' }}>Kompakt</option>
+        <option value="extended" {{ 'selected' if user['card_view_mode'] == 'extended' else '' }}>Erweitert</option>
+      </select>
+    </label>
     <div class="actions-row">
-      <button type="submit">Modus speichern</button>
+      <button type="submit">Darstellung speichern</button>
     </div>
   </form>
 </section>

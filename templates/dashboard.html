@@ -33,6 +33,8 @@
           class="task-card {{ 'task-assigned-to-me' if assigned_to_me else '' }} {{ 'task-due-today' if due_today else '' }} {{ 'draggable-task' if (user['is_admin'] or task['id'] in editable_task_ids) else '' }} {{ 'assignee-drop-enabled' if (task['status'] != 'closed' and can_assign_members) else '' }}"
           data-task-id="{{ task['id'] }}"
           data-current-status="{{ status }}"
+          data-created-at="{{ task['created_at'] }}"
+          data-created-at-display="{{ format_system_datetime(task['created_at']) }}"
           data-can-assign="{{ 'true' if (task['status'] != 'closed' and can_assign_members) else 'false' }}"
           draggable="{{ 'true' if (user['is_admin'] or task['id'] in editable_task_ids) else 'false' }}"
         >
@@ -40,10 +42,22 @@
           {% if due_today %}
           <span class="due-today-chip">Heute fällig</span>
           {% endif %}
-          <small>Ansprechpartner: {{ task['contact_person'] }}</small>
-          <small>Erstellt am: {{ format_system_datetime(task['created_at']) }}</small>
-          <small>Fällig bis: {{ format_datetime(task['due_date']) }}</small>
-          <small>Erstellt von: {{ task['creator_name'] }}</small>
+          <div class="task-card-meta">
+            <div class="task-meta-row task-meta-row-due">
+              <span class="task-meta-key">Fällig bis</span>
+              <span class="task-meta-value">{{ format_datetime(task['due_date']) }}</span>
+            </div>
+            {% if user['card_view_mode'] == 'extended' %}
+            <div class="task-meta-row">
+              <span class="task-meta-key">Erstellt am</span>
+              <span class="task-meta-value">{{ format_system_datetime(task['created_at']) }}</span>
+            </div>
+            <div class="task-meta-row">
+              <span class="task-meta-key">Erstellt von</span>
+              <span class="task-meta-value">{{ task['creator_name'] }}</span>
+            </div>
+            {% endif %}
+          </div>
           <a
             class="task-open-btn {{ 'readonly' if task_read_only else '' }}"
             href="{{ url_for('task_detail', task_id=task['id']) }}"
@@ -111,7 +125,12 @@
       <input type="time" name="due_time">
     </label>
     <label class="field-compact">Ansprechpartner
-      <input type="text" name="contact_person" required>
+      <select name="contact_person_user_id" required>
+        <option value="" selected disabled>Bitte wählen</option>
+        {% for person in users %}
+        <option value="{{ person['id'] }}">{{ person['initials'] }} - {{ person['username'] }}</option>
+        {% endfor %}
+      </select>
     </label>
     <div class="actions-row">
       <button type="submit">Task anlegen</button>
@@ -136,194 +155,407 @@
 </dialog>
 
 <script>
-  const dialog = document.getElementById("create-task-dialog");
-  const openBtn = document.getElementById("open-create-task");
-  const closeBtn = document.getElementById("close-create-task");
-  const closeTaskDialog = document.getElementById("close-task-dialog");
-  const closeTaskForm = document.getElementById("close-task-form");
-  const closeTaskReason = document.getElementById("close-task-reason");
-  const closeTaskDialogAbort = document.getElementById("close-task-dialog-abort");
-  const draggableTasks = document.querySelectorAll(".draggable-task");
-  const dropColumns = document.querySelectorAll(".drop-column");
-  const draggableMembers = document.querySelectorAll(".sidebar-draggable-member");
-  const assigneeDropCards = document.querySelectorAll('.task-card[data-can-assign="true"]');
-  let draggedTask = null;
-  let draggedMember = null;
-  let pendingCloseTaskId = null;
+  (() => {
+    const dialog = document.getElementById("create-task-dialog");
+    const openBtn = document.getElementById("open-create-task");
+    const closeBtn = document.getElementById("close-create-task");
+    const closeTaskDialog = document.getElementById("close-task-dialog");
+    const closeTaskForm = document.getElementById("close-task-form");
+    const closeTaskReason = document.getElementById("close-task-reason");
+    const closeTaskDialogAbort = document.getElementById("close-task-dialog-abort");
+    const dropColumns = document.querySelectorAll(".drop-column");
+    const draggableMembers = document.querySelectorAll(".sidebar-draggable-member");
+    const columns = document.querySelectorAll(".column[data-status]");
 
-  openBtn.addEventListener("click", () => dialog.showModal());
-  closeBtn.addEventListener("click", () => dialog.close());
-  closeTaskDialogAbort.addEventListener("click", () => {
-    pendingCloseTaskId = null;
-    closeTaskDialog.close();
-  });
+    const REFRESH_INTERVAL_MS = Number("{{ (app_settings['overview_refresh_interval_seconds']|int if app_settings else 1) * 1000 }}") || 1000;
+    const USE_EXTENDED_META = "{{ '1' if user['card_view_mode'] == 'extended' else '0' }}" === "1";
 
-  closeTaskForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    if (!pendingCloseTaskId) {
+    const cardById = new Map();
+    let draggedTask = null;
+    let draggedMember = null;
+    let pendingCloseTaskId = null;
+
+    const openReadonlySvg = `<svg class="task-open-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"></circle></svg>`;
+    const openEditSvg = `<svg class="task-open-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 21l3.7-.7L19 8a2.1 2.1 0 0 0 0-3L18 4a2.1 2.1 0 0 0-3 0L3.7 15.3 3 19z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><path d="M14 5l5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>`;
+
+    const findColumnByStatus = (status) => document.querySelector(`.column[data-status="${status}"]`);
+
+    const updateColumnCountAndEmpty = (column) => {
+      const list = column.querySelector(".task-list");
+      const count = column.querySelector(".count");
+      if (!list || !count) {
+        return;
+      }
+
+      const cardCount = list.querySelectorAll(".task-card").length;
+      count.textContent = String(cardCount);
+
+      const empty = list.querySelector(".empty");
+      if (cardCount === 0 && !empty) {
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = "Keine Tasks";
+        list.appendChild(p);
+      }
+      if (cardCount > 0 && empty) {
+        empty.remove();
+      }
+    };
+
+    const escapeHtml = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+
+    const formatSystemDateTime = (rawValue) => {
+      if (!rawValue) {
+        return "-";
+      }
+      const parsed = new Date(rawValue);
+      if (Number.isNaN(parsed.getTime())) {
+        return "-";
+      }
+      try {
+        const formatter = new Intl.DateTimeFormat("de-DE", {
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
+        return `${formatter.format(parsed)} Uhr`;
+      } catch (error) {
+        return "-";
+      }
+    };
+
+    const renderAssigneesHtml = (assignees) => {
+      if (!Array.isArray(assignees) || !assignees.length) {
+        return '<span class="muted">Nicht zugewiesen</span>';
+      }
+      return assignees
+        .map((assignee) => {
+          const classes = `initial-badge ${assignee.color_class || "badge-dev"}`;
+          const title = `${escapeHtml(assignee.username || "")} (${escapeHtml(assignee.role_label || "")})`;
+          const initials = escapeHtml(assignee.initials || "USR");
+          const badgeColor = escapeHtml(assignee.badge_color || "");
+          const inlineStyle = badgeColor ? ` style="background:${badgeColor};"` : "";
+          return `<span class="${classes}" title="${title}"${inlineStyle}>${initials}</span>`;
+        })
+        .join("");
+    };
+
+    const renderCardInner = (card, task) => {
+      const dueChip = task.due_today ? '<span class="due-today-chip">Heute fällig</span>' : "";
+      const openTitle = task.task_read_only ? "Task ansehen" : "Task bearbeiten";
+      const readonlyClass = task.task_read_only ? "readonly" : "";
+      const createdAtText = task.created_at_display || card.dataset.createdAtDisplay || formatSystemDateTime(task.created_at);
+      const extraMeta = USE_EXTENDED_META
+        ? `<div class="task-meta-row"><span class="task-meta-key">Erstellt am</span><span class="task-meta-value">${escapeHtml(createdAtText || "-")}</span></div>
+           <div class="task-meta-row"><span class="task-meta-key">Erstellt von</span><span class="task-meta-value">${escapeHtml(task.creator_name || "-")}</span></div>`
+        : "";
+
+      card.innerHTML = `
+        <strong>${escapeHtml(task.title || "(Ohne Titel)")}</strong>
+        ${dueChip}
+        <div class="task-card-meta">
+          <div class="task-meta-row task-meta-row-due">
+            <span class="task-meta-key">Fällig bis</span>
+            <span class="task-meta-value">${escapeHtml(task.due_date_display || "-")}</span>
+          </div>
+          ${extraMeta}
+        </div>
+        <a class="task-open-btn ${readonlyClass}" href="/tasks/${task.id}" title="${openTitle}" aria-label="${openTitle}">
+          ${task.task_read_only ? openReadonlySvg : openEditSvg}
+        </a>
+        <div class="task-footer">
+          <small>Bearbeiter:</small>
+          <div class="assignee-badges">${renderAssigneesHtml(task.assignees)}</div>
+        </div>
+      `;
+    };
+
+    const applyTaskState = (card, task) => {
+      card.dataset.taskId = String(task.id);
+      card.dataset.currentStatus = task.status;
+      card.dataset.canAssign = task.can_assign ? "true" : "false";
+      card.dataset.createdAt = task.created_at || card.dataset.createdAt || "";
+      card.dataset.createdAtDisplay = task.created_at_display || card.dataset.createdAtDisplay || "";
+      card.draggable = !!task.can_drag;
+
+      card.className = "task-card";
+      if (task.assigned_to_me) {
+        card.classList.add("task-assigned-to-me");
+      }
+      if (task.due_today) {
+        card.classList.add("task-due-today");
+      }
+      if (task.can_drag) {
+        card.classList.add("draggable-task");
+      }
+      if (task.can_assign) {
+        card.classList.add("assignee-drop-enabled");
+      }
+    };
+
+    const submitStatusChange = (taskId, status, closeReason = "") => {
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = `/tasks/${taskId}/status`;
+
+      const statusInput = document.createElement("input");
+      statusInput.type = "hidden";
+      statusInput.name = "status";
+      statusInput.value = status;
+
+      const filterInput = document.createElement("input");
+      filterInput.type = "hidden";
+      filterInput.name = "return_filter";
+      filterInput.value = "{{ filter_mode }}";
+
+      const closeReasonInput = document.createElement("input");
+      closeReasonInput.type = "hidden";
+      closeReasonInput.name = "close_reason";
+      closeReasonInput.value = closeReason;
+
+      form.appendChild(statusInput);
+      form.appendChild(filterInput);
+      form.appendChild(closeReasonInput);
+      document.body.appendChild(form);
+      form.submit();
+    };
+
+    const submitAddAssignee = (taskId, userId) => {
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = `/tasks/${taskId}/assignees/add`;
+
+      const userInput = document.createElement("input");
+      userInput.type = "hidden";
+      userInput.name = "user_id";
+      userInput.value = userId;
+
+      const filterInput = document.createElement("input");
+      filterInput.type = "hidden";
+      filterInput.name = "return_filter";
+      filterInput.value = "{{ filter_mode }}";
+
+      form.appendChild(userInput);
+      form.appendChild(filterInput);
+      document.body.appendChild(form);
+      form.submit();
+    };
+
+    const clearAssigneeTargets = () => {
+      document.querySelectorAll('.task-card[data-can-assign="true"]').forEach((card) => card.classList.remove("drop-target"));
+    };
+
+    const bindTaskCard = (card) => {
+      if (card.dataset.boundCard === "true") {
+        return;
+      }
+      card.dataset.boundCard = "true";
+
+      card.addEventListener("dragstart", () => {
+        if (!card.draggable) {
+          return;
+        }
+        draggedTask = card;
+        card.classList.add("dragging");
+      });
+
+      card.addEventListener("dragend", () => {
+        card.classList.remove("dragging");
+        draggedTask = null;
+        dropColumns.forEach((column) => column.classList.remove("drop-target"));
+      });
+
+      card.addEventListener("dragover", (event) => {
+        if (!draggedMember || card.dataset.canAssign !== "true") {
+          return;
+        }
+        event.preventDefault();
+        card.classList.add("drop-target");
+      });
+
+      card.addEventListener("dragleave", () => {
+        card.classList.remove("drop-target");
+      });
+
+      card.addEventListener("drop", (event) => {
+        if (!draggedMember || card.dataset.canAssign !== "true") {
+          return;
+        }
+        event.preventDefault();
+        card.classList.remove("drop-target");
+
+        const taskId = card.dataset.taskId;
+        const userId = draggedMember.dataset.userId;
+        if (!taskId || !userId) {
+          return;
+        }
+        submitAddAssignee(taskId, userId);
+      });
+    };
+
+    const createTaskCard = (task) => {
+      const card = document.createElement("div");
+      applyTaskState(card, task);
+      renderCardInner(card, task);
+      bindTaskCard(card);
+      return card;
+    };
+
+    const updateTaskCard = (card, task) => {
+      applyTaskState(card, task);
+      renderCardInner(card, task);
+    };
+
+    openBtn.addEventListener("click", () => dialog.showModal());
+    closeBtn.addEventListener("click", () => dialog.close());
+    closeTaskDialogAbort.addEventListener("click", () => {
+      pendingCloseTaskId = null;
       closeTaskDialog.close();
-      return;
+    });
+
+    closeTaskForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!pendingCloseTaskId) {
+        closeTaskDialog.close();
+        return;
+      }
+      if (!closeTaskReason.checkValidity()) {
+        closeTaskReason.reportValidity();
+        return;
+      }
+      const reason = closeTaskReason.value.trim();
+      if (!reason) {
+        closeTaskReason.reportValidity();
+        return;
+      }
+      const taskId = pendingCloseTaskId;
+      pendingCloseTaskId = null;
+      closeTaskDialog.close();
+      submitStatusChange(taskId, "closed", reason);
+    });
+
+    draggableMembers.forEach((member) => {
+      member.addEventListener("dragstart", () => {
+        draggedMember = member;
+        member.classList.add("dragging");
+      });
+      member.addEventListener("dragend", () => {
+        member.classList.remove("dragging");
+        draggedMember = null;
+        clearAssigneeTargets();
+      });
+    });
+
+    dropColumns.forEach((column) => {
+      column.addEventListener("dragover", (event) => {
+        if (!draggedTask) {
+          return;
+        }
+        event.preventDefault();
+        column.classList.add("drop-target");
+      });
+
+      column.addEventListener("dragleave", () => {
+        column.classList.remove("drop-target");
+      });
+
+      column.addEventListener("drop", (event) => {
+        event.preventDefault();
+        column.classList.remove("drop-target");
+        if (!draggedTask) {
+          return;
+        }
+
+        const targetStatus = column.dataset.status;
+        const taskId = draggedTask.dataset.taskId;
+        const currentStatus = draggedTask.dataset.currentStatus;
+        if (!taskId || !targetStatus || currentStatus === targetStatus) {
+          return;
+        }
+        if (targetStatus === "closed") {
+          pendingCloseTaskId = taskId;
+          closeTaskReason.value = "";
+          closeTaskDialog.showModal();
+          return;
+        }
+        submitStatusChange(taskId, targetStatus);
+      });
+    });
+
+    document.querySelectorAll(".task-card[data-task-id]").forEach((card) => {
+      cardById.set(String(card.dataset.taskId), card);
+      bindTaskCard(card);
+    });
+
+    const pollAndSyncDashboard = async () => {
+      try {
+        const response = await fetch(`{{ url_for('dashboard_tasks_api') }}?filter={{ filter_mode }}`, {
+          headers: { "Accept": "application/json" },
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          return;
+        }
+
+        const data = await response.json();
+        const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+        const serverIds = new Set();
+
+        tasks.forEach((task) => {
+          const id = String(task.id);
+          serverIds.add(id);
+
+          const existing = cardById.get(id);
+          if (existing) {
+            const oldStatus = existing.dataset.currentStatus;
+            updateTaskCard(existing, task);
+            if (oldStatus !== task.status) {
+              const targetColumn = findColumnByStatus(task.status);
+              const targetList = targetColumn ? targetColumn.querySelector(".task-list") : null;
+              if (targetList) {
+                targetList.prepend(existing);
+              }
+            }
+            return;
+          }
+
+          const column = findColumnByStatus(task.status);
+          const list = column ? column.querySelector(".task-list") : null;
+          if (!list) {
+            return;
+          }
+
+          const card = createTaskCard(task);
+          list.prepend(card);
+          cardById.set(id, card);
+        });
+
+        Array.from(cardById.entries()).forEach(([id, card]) => {
+          if (serverIds.has(id)) {
+            return;
+          }
+          card.remove();
+          cardById.delete(id);
+        });
+
+        columns.forEach((column) => updateColumnCountAndEmpty(column));
+      } catch (error) {
+        // Ignore transient polling issues.
+      }
+    };
+
+    if (columns.length) {
+      setInterval(pollAndSyncDashboard, REFRESH_INTERVAL_MS);
     }
-
-    if (!closeTaskReason.checkValidity()) {
-      closeTaskReason.reportValidity();
-      return;
-    }
-
-    const reason = closeTaskReason.value.trim();
-    if (!reason) {
-      closeTaskReason.reportValidity();
-      return;
-    }
-
-    const taskId = pendingCloseTaskId;
-    pendingCloseTaskId = null;
-    closeTaskDialog.close();
-    submitStatusChange(taskId, "closed", reason);
-  });
-
-  const submitStatusChange = (taskId, status, closeReason = "") => {
-    const form = document.createElement("form");
-    form.method = "post";
-    form.action = `/tasks/${taskId}/status`;
-
-    const statusInput = document.createElement("input");
-    statusInput.type = "hidden";
-    statusInput.name = "status";
-    statusInput.value = status;
-
-    const filterInput = document.createElement("input");
-    filterInput.type = "hidden";
-    filterInput.name = "return_filter";
-    filterInput.value = "{{ filter_mode }}";
-
-    const closeReasonInput = document.createElement("input");
-    closeReasonInput.type = "hidden";
-    closeReasonInput.name = "close_reason";
-    closeReasonInput.value = closeReason;
-
-    form.appendChild(statusInput);
-    form.appendChild(filterInput);
-    form.appendChild(closeReasonInput);
-    document.body.appendChild(form);
-    form.submit();
-  };
-
-  const submitAddAssignee = (taskId, userId) => {
-    const form = document.createElement("form");
-    form.method = "post";
-    form.action = `/tasks/${taskId}/assignees/add`;
-
-    const userInput = document.createElement("input");
-    userInput.type = "hidden";
-    userInput.name = "user_id";
-    userInput.value = userId;
-
-    const filterInput = document.createElement("input");
-    filterInput.type = "hidden";
-    filterInput.name = "return_filter";
-    filterInput.value = "{{ filter_mode }}";
-
-    form.appendChild(userInput);
-    form.appendChild(filterInput);
-    document.body.appendChild(form);
-    form.submit();
-  };
-
-  draggableMembers.forEach((member) => {
-    member.addEventListener("dragstart", () => {
-      draggedMember = member;
-      member.classList.add("dragging");
-    });
-
-    member.addEventListener("dragend", () => {
-      member.classList.remove("dragging");
-      draggedMember = null;
-      assigneeDropCards.forEach((card) => card.classList.remove("drop-target"));
-    });
-  });
-
-  draggableTasks.forEach((task) => {
-    task.addEventListener("dragstart", () => {
-      draggedTask = task;
-      task.classList.add("dragging");
-    });
-
-    task.addEventListener("dragend", () => {
-      task.classList.remove("dragging");
-      draggedTask = null;
-      dropColumns.forEach((column) => column.classList.remove("drop-target"));
-    });
-  });
-
-  dropColumns.forEach((column) => {
-    column.addEventListener("dragover", (event) => {
-      if (!draggedTask) {
-        return;
-      }
-      event.preventDefault();
-      column.classList.add("drop-target");
-    });
-
-    column.addEventListener("dragleave", () => {
-      column.classList.remove("drop-target");
-    });
-
-    column.addEventListener("drop", (event) => {
-      event.preventDefault();
-      column.classList.remove("drop-target");
-      if (!draggedTask) {
-        return;
-      }
-
-      const targetStatus = column.dataset.status;
-      const taskId = draggedTask.dataset.taskId;
-      const currentStatus = draggedTask.dataset.currentStatus;
-
-      if (!taskId || !targetStatus || currentStatus === targetStatus) {
-        return;
-      }
-
-      if (targetStatus === "closed") {
-        pendingCloseTaskId = taskId;
-        closeTaskReason.value = "";
-        closeTaskDialog.showModal();
-        return;
-      }
-
-      submitStatusChange(taskId, targetStatus);
-    });
-  });
-
-  assigneeDropCards.forEach((card) => {
-    card.addEventListener("dragover", (event) => {
-      if (!draggedMember) {
-        return;
-      }
-      event.preventDefault();
-      card.classList.add("drop-target");
-    });
-
-    card.addEventListener("dragleave", () => {
-      card.classList.remove("drop-target");
-    });
-
-    card.addEventListener("drop", (event) => {
-      event.preventDefault();
-      card.classList.remove("drop-target");
-      if (!draggedMember) {
-        return;
-      }
-
-      const taskId = card.dataset.taskId;
-      const userId = draggedMember.dataset.userId;
-      if (!taskId || !userId) {
-        return;
-      }
-
-      submitAddAssignee(taskId, userId);
-    });
-  });
+  })();
 </script>
 </div>
 {% endblock %}

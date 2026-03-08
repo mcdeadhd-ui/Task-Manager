@@ -78,6 +78,9 @@ TONE_OPTIONS = {
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
 VALID_THEME_MODES = {THEME_LIGHT, THEME_DARK}
+CARD_VIEW_COMPACT = "compact"
+CARD_VIEW_EXTENDED = "extended"
+VALID_CARD_VIEW_MODES = {CARD_VIEW_COMPACT, CARD_VIEW_EXTENDED}
 
 
 app = Flask(__name__)
@@ -188,6 +191,10 @@ def init_db() -> None:
         db.execute("ALTER TABLE users ADD COLUMN role TEXT")
     if "theme_mode" not in columns:
         db.execute(f"ALTER TABLE users ADD COLUMN theme_mode TEXT NOT NULL DEFAULT '{THEME_LIGHT}'")
+    if "card_view_mode" not in columns:
+        db.execute(
+            f"ALTER TABLE users ADD COLUMN card_view_mode TEXT NOT NULL DEFAULT '{CARD_VIEW_COMPACT}'"
+        )
 
     task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)").fetchall()}
     if "due_date" not in task_columns:
@@ -198,6 +205,8 @@ def init_db() -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN closed_at TEXT")
     if "closed_by" not in task_columns:
         db.execute("ALTER TABLE tasks ADD COLUMN closed_by INTEGER")
+    if "contact_person_user_id" not in task_columns:
+        db.execute("ALTER TABLE tasks ADD COLUMN contact_person_user_id INTEGER")
 
     comment_columns = {row["name"] for row in db.execute("PRAGMA table_info(task_comments)").fetchall()}
     if "updated_at" not in comment_columns:
@@ -208,6 +217,22 @@ def init_db() -> None:
         UPDATE tasks
         SET due_date = substr(created_at, 1, 16)
         WHERE due_date IS NULL OR TRIM(due_date) = ''
+        """
+    )
+
+    # Backfill contact_person_user_id for legacy rows where contact person was stored as plain text.
+    db.execute(
+        """
+        UPDATE tasks
+        SET contact_person_user_id = (
+            SELECT u.id
+            FROM users u
+            WHERE lower(u.username) = lower(tasks.contact_person)
+            LIMIT 1
+        )
+        WHERE (contact_person_user_id IS NULL OR contact_person_user_id = 0)
+          AND contact_person IS NOT NULL
+          AND TRIM(contact_person) != ''
         """
     )
 
@@ -234,6 +259,15 @@ def init_db() -> None:
         WHERE theme_mode IS NULL OR TRIM(theme_mode) = '' OR lower(theme_mode) NOT IN ('light', 'dark')
         """,
         (THEME_LIGHT,),
+    )
+
+    db.execute(
+        """
+        UPDATE users
+        SET card_view_mode = ?
+        WHERE card_view_mode IS NULL OR TRIM(card_view_mode) = '' OR lower(card_view_mode) NOT IN ('compact', 'extended')
+        """,
+        (CARD_VIEW_COMPACT,),
     )
 
     # Migrate legacy single assignee values into the many-to-many table.
@@ -557,6 +591,19 @@ def badge_color_class(role: str, is_admin: int) -> str:
     return "badge-dev"
 
 
+def badge_color_value(role: str, is_admin: int) -> str:
+    settings = app_settings()
+    if is_admin:
+        return settings.get("role_color_admin", "#facc15")
+    if role in BUILTIN_ROLE_CONFIG:
+        key = BUILTIN_ROLE_CONFIG[role]["setting_key"]
+        return settings.get(key, "#64748b")
+    custom = custom_roles_map().get(role)
+    if custom is not None:
+        return custom.get("color", "#64748b")
+    return settings.get("role_color_dev", "#2563eb")
+
+
 def custom_role_css_rules():
     rules = []
     for role in active_custom_roles():
@@ -636,6 +683,7 @@ def task_assignees_map(task_ids: list[int]):
                 "initials": row["initials"] or make_initials_from_username(row["username"]),
                 "role_label": role_label(row["role"], row["is_admin"]),
                 "color_class": badge_color_class(row["role"], row["is_admin"]),
+                "badge_color": badge_color_value(row["role"], row["is_admin"]),
             }
         )
     return mapping
@@ -650,6 +698,26 @@ def enrich_tasks_with_assignees(tasks):
         task_dict["assignees"] = mapping.get(task["id"], [])
         enriched.append(task_dict)
     return enriched
+
+
+def contact_person_badge(task_row) -> dict | None:
+    cp_user_id = task_row.get("contact_person_user_id")
+    cp_name = task_row.get("contact_person_name") or task_row.get("contact_person")
+    if cp_user_id is None and not cp_name:
+        return None
+
+    role = task_row.get("contact_person_role")
+    is_admin = int(task_row.get("contact_person_is_admin") or 0)
+    initials_raw = task_row.get("contact_person_initials")
+
+    return {
+        "id": int(cp_user_id) if cp_user_id is not None else None,
+        "username": cp_name or "-",
+        "initials": initials_raw or make_initials_from_username(cp_name or "USR"),
+        "role_label": role_label(role, is_admin),
+        "color_class": badge_color_class(role, is_admin),
+        "badge_color": badge_color_value(role, is_admin),
+    }
 
 
 def sidebar_users():
@@ -712,9 +780,15 @@ def fetch_tasks(*, status: str | None = None, only_assigned_to: int | None = Non
         SELECT
             t.*,
             c.username AS creator_name,
+            cp.id AS contact_person_user_id,
+            cp.username AS contact_person_name,
+            cp.initials AS contact_person_initials,
+            cp.role AS contact_person_role,
+            cp.is_admin AS contact_person_is_admin,
             COALESCE(GROUP_CONCAT(DISTINCT au.username), '') AS assignee_names
         FROM tasks t
         JOIN users c ON c.id = t.created_by
+        LEFT JOIN users cp ON cp.id = t.contact_person_user_id
         LEFT JOIN task_assignees ta ON ta.task_id = t.id
         LEFT JOIN users au ON au.id = ta.user_id
         {where_sql}
@@ -1117,6 +1191,13 @@ def dashboard():
     )
     tasks = fetch_tasks(only_assigned_to=user["id"] if filter_mode == "mine" else None)
     tasks = enrich_tasks_with_assignees(tasks)
+    tasks = [
+        {
+            **task,
+            "contact_person_badge": contact_person_badge(task),
+        }
+        for task in tasks
+    ]
     editable_task_ids = set() if user["is_admin"] else assigned_task_ids_for_user(user["id"])
 
     grouped = {
@@ -1173,10 +1254,55 @@ def overview_tasks_api():
                 "title": task["title"],
                 "status": task["status"],
                 "created_at": task["created_at"],
+                "created_at_display": format_system_datetime_for_display(task["created_at"]),
                 "due_date_display": format_datetime_for_display(task["due_date"]),
                 "assignees": task["assignees"],
             }
         )
+    return jsonify({"tasks": payload})
+
+
+@app.route("/api/dashboard/tasks")
+@login_required
+def dashboard_tasks_api():
+    user = current_user()
+    filter_mode = request.args.get("filter", "all").strip().lower()
+    if filter_mode not in {"all", "mine"}:
+        filter_mode = "all"
+
+    tasks = fetch_tasks(only_assigned_to=user["id"] if filter_mode == "mine" else None)
+    tasks = enrich_tasks_with_assignees(tasks)
+    editable_task_ids = set() if user["is_admin"] else assigned_task_ids_for_user(user["id"])
+
+    payload = []
+    for task in tasks:
+        assigned_to_me = any(int(assignee["id"]) == int(user["id"]) for assignee in task["assignees"])
+        can_write_task = bool(
+            user["is_admin"] or int(task["created_by"]) == int(user["id"]) or int(task["id"]) in editable_task_ids
+        )
+        can_assign_members = bool(user["is_admin"] or int(task["created_by"]) == int(user["id"]))
+        task_read_only = bool(task["status"] == STATUS_CLOSED or not can_write_task)
+        can_drag = bool(user["is_admin"] or int(task["id"]) in editable_task_ids)
+
+        payload.append(
+            {
+                "id": int(task["id"]),
+                "title": task["title"],
+                "status": task["status"],
+                "created_at": task["created_at"],
+                "due_date_display": format_datetime_for_display(task["due_date"]),
+                "contact_person": task.get("contact_person", ""),
+                "contact_person_badge": contact_person_badge(task),
+                "creator_name": task.get("creator_name", ""),
+                "assignees": task["assignees"],
+                "assigned_to_me": assigned_to_me,
+                "due_today": is_due_today(task.get("due_date")),
+                "task_read_only": task_read_only,
+                "can_drag": can_drag,
+                "can_assign": bool(task["status"] != STATUS_CLOSED and can_assign_members),
+            }
+        )
+
     return jsonify({"tasks": payload})
 
 
@@ -1343,15 +1469,19 @@ def settings_page():
 
         if action == "theme":
             theme_mode = request.form.get("theme_mode", THEME_LIGHT).strip().lower()
+            card_view_mode = request.form.get("card_view_mode", CARD_VIEW_COMPACT).strip().lower()
             if theme_mode not in VALID_THEME_MODES:
                 flash("Ungültiger Modus ausgewählt.", "error")
                 return redirect(url_for("settings_page"))
+            if card_view_mode not in VALID_CARD_VIEW_MODES:
+                flash("Ungültige Kartenansicht ausgewählt.", "error")
+                return redirect(url_for("settings_page"))
 
             execute(
-                "UPDATE users SET theme_mode = ? WHERE id = ?",
-                (theme_mode, user["id"]),
+                "UPDATE users SET theme_mode = ?, card_view_mode = ? WHERE id = ?",
+                (theme_mode, card_view_mode, user["id"]),
             )
-            flash("Darstellungsmodus wurde gespeichert.", "success")
+            flash("Darstellung wurde gespeichert.", "success")
             return redirect(url_for("settings_page"))
 
         if action == "admin-settings":
@@ -1547,13 +1677,27 @@ def create_task():
 
     title = request.form.get("title", "").strip()
     description = request.form.get("description", "").strip()
-    contact_person = request.form.get("contact_person", "").strip()
+    contact_person_user_id_raw = request.form.get("contact_person_user_id", "").strip()
     due_date = request.form.get("due_date", "").strip()
     due_time = request.form.get("due_time", "").strip()
     assignee_ids_raw = request.form.getlist("assignee_ids")
 
-    if not title or not description or not contact_person or not due_date:
+    if not title or not description or not due_date:
         flash("Bitte alle Pflichtfelder ausfüllen.", "error")
+        return redirect(url_for("dashboard"))
+
+    try:
+        contact_person_user_id = int(contact_person_user_id_raw)
+    except ValueError:
+        flash("Bitte einen gültigen Ansprechpartner auswählen.", "error")
+        return redirect(url_for("dashboard"))
+
+    contact_user = query_one(
+        "SELECT id, username FROM users WHERE id = ?",
+        (contact_person_user_id,),
+    )
+    if contact_user is None:
+        flash("Ansprechpartner nicht gefunden.", "error")
         return redirect(url_for("dashboard"))
 
     normalized_due_date = normalize_due_date_value(due_date, due_time)
@@ -1588,19 +1732,21 @@ def create_task():
             assignee_id,
             due_date,
             contact_person,
+            contact_person_user_id,
             created_by,
             status,
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             title,
             description,
             assignee_ids[0] if assignee_ids else None,
             normalized_due_date,
-            contact_person,
+            contact_user["username"],
+            contact_person_user_id,
             user["id"],
             STATUS_OPEN,
             now,
@@ -1677,9 +1823,15 @@ def task_with_details(task_id: int):
         """
         SELECT
             t.*,
-            c.username AS creator_name
+            c.username AS creator_name,
+            cp.id AS contact_person_user_id,
+            cp.username AS contact_person_name,
+            cp.initials AS contact_person_initials,
+            cp.role AS contact_person_role,
+            cp.is_admin AS contact_person_is_admin
         FROM tasks t
         JOIN users c ON c.id = t.created_by
+        LEFT JOIN users cp ON cp.id = t.contact_person_user_id
         WHERE t.id = ?
         """,
         (task_id,),
@@ -1688,6 +1840,13 @@ def task_with_details(task_id: int):
         return None
 
     task_dict = dict(task)
+    contact_name = (task_dict.get("contact_person_name") or task_dict.get("contact_person") or "").strip()
+    if contact_name:
+        contact_initials = task_dict.get("contact_person_initials") or make_initials_from_username(contact_name)
+        task_dict["contact_person_display"] = f"{contact_initials} - {contact_name}"
+    else:
+        task_dict["contact_person_display"] = "-"
+
     assignees = task_assignees_map([task_id]).get(task_id, [])
     comments = []
     for comment in task_comments(task_id):
@@ -1974,10 +2133,25 @@ def edit_task(task_id: int):
     description = request.form.get("description", "").strip()
     due_date = request.form.get("due_date", "").strip()
     due_time = request.form.get("due_time", "").strip()
+    contact_person_user_id_raw = request.form.get("contact_person_user_id", "").strip()
     assignee_ids_raw = request.form.getlist("assignee_ids")
 
     if not title or not description or not due_date:
         flash("Titel, Beschreibung und Fälligkeitsdatum sind erforderlich.", "error")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    try:
+        contact_person_user_id = int(contact_person_user_id_raw)
+    except ValueError:
+        flash("Bitte einen gültigen Ansprechpartner auswählen.", "error")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    contact_user = query_one(
+        "SELECT id, username FROM users WHERE id = ?",
+        (contact_person_user_id,),
+    )
+    if contact_user is None:
+        flash("Ansprechpartner nicht gefunden.", "error")
         return redirect(url_for("task_detail", task_id=task_id))
 
     normalized_due_date = normalize_due_date_value(due_date, due_time)
@@ -2006,7 +2180,7 @@ def edit_task(task_id: int):
     execute(
         """
         UPDATE tasks
-        SET title = ?, description = ?, due_date = ?, assignee_id = ?, updated_at = ?
+        SET title = ?, description = ?, due_date = ?, assignee_id = ?, contact_person = ?, contact_person_user_id = ?, updated_at = ?
         WHERE id = ?
         """,
         (
@@ -2014,6 +2188,8 @@ def edit_task(task_id: int):
             description,
             normalized_due_date,
             assignee_ids[0] if assignee_ids else None,
+            contact_user["username"],
+            contact_person_user_id,
             now_iso(),
             task_id,
         ),

@@ -2,25 +2,51 @@
 {% block title %}Task #{{ task['id'] }} | Task Manager{% endblock %}
 {% block content %}
 {% if not can_edit_task_content %}
-<section class="card">
+<section class="card task-view-card">
   <div class="section-head">
     <h2>{{ task['title'] }}</h2>
     <span class="badge">{{ status_label(task['status']) }}</span>
   </div>
-  <p>{{ task['description'] }}</p>
-  <small>Ansprechpartner: {{ task['contact_person'] }}</small><br>
-  <small>Erstellt am: {{ format_system_datetime(task['created_at']) }}</small><br>
-  <small>Fällig bis: {{ format_datetime(task['due_date']) }}</small><br>
-  <small>Erstellt von: {{ task['creator_name'] }}</small>
-  {% if task['status'] == 'closed' %}
-  <br><small><strong>Schließungsgrund:</strong> {{ task['close_reason'] or '-' }}</small>
-  {% endif %}
-  <div class="task-footer">
-    <small>Bearbeiter:</small>
+  <div class="task-view-block">
+    <small class="task-view-label">Beschreibung</small>
+    <p class="task-view-description">{{ task['description'] }}</p>
+  </div>
+
+  <div class="task-view-meta-grid">
+    <div class="task-view-meta-item">
+      <small class="task-view-label">Ansprechpartner</small>
+      <strong>{{ task['contact_person_display'] }}</strong>
+    </div>
+    <div class="task-view-meta-item">
+      <small class="task-view-label">Fällig bis</small>
+      <strong>{{ format_datetime(task['due_date']) }}</strong>
+    </div>
+    <div class="task-view-meta-item">
+      <small class="task-view-label">Erstellt am</small>
+      <strong>{{ format_system_datetime(task['created_at']) }}</strong>
+    </div>
+    <div class="task-view-meta-item">
+      <small class="task-view-label">Erstellt von</small>
+      <strong>{{ task['creator_name'] }}</strong>
+    </div>
+    {% if task['status'] == 'closed' %}
+    <div class="task-view-meta-item task-view-meta-full">
+      <small class="task-view-label">Schließungsgrund</small>
+      <strong>{{ task['close_reason'] or '-' }}</strong>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="task-view-assignees">
+    <small class="task-view-label">Bearbeiter</small>
     <div class="assignee-badges">
-      {% for assignee in task['assignees'] %}
-      <span class="initial-badge {{ assignee['color_class'] }}" title="{{ assignee['username'] }} ({{ assignee['role_label'] }})">{{ assignee['initials'] }}</span>
-      {% endfor %}
+      {% if task['assignees'] %}
+        {% for assignee in task['assignees'] %}
+        <span class="initial-badge {{ assignee['color_class'] }}" title="{{ assignee['username'] }} ({{ assignee['role_label'] }})">{{ assignee['initials'] }}</span>
+        {% endfor %}
+      {% else %}
+        <span class="muted">Nicht zugewiesen</span>
+      {% endif %}
     </div>
   </div>
 </section>
@@ -41,6 +67,15 @@
         {% set assigned_ids = task['assignees'] | map(attribute='id') | list %}
         {% for person in users %}
         <option value="{{ person['id'] }}" {{ 'selected' if person['id'] in assigned_ids else '' }}>
+          {{ person['initials'] }} - {{ person['username'] }}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field-compact">Ansprechpartner
+      <select name="contact_person_user_id" required>
+        {% for person in users %}
+        <option value="{{ person['id'] }}" {{ 'selected' if task['contact_person_user_id'] and person['id'] == task['contact_person_user_id'] else '' }}>
           {{ person['initials'] }} - {{ person['username'] }}
         </option>
         {% endfor %}
