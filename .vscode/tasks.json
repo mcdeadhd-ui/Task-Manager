@@ -4,13 +4,19 @@
         {
             "label": "Publish to GitHub",
             "type": "shell",
-            "command": "powershell",
+            "command": "bash",
             "args": [
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                "${workspaceFolder}/publish.ps1"
+                "${workspaceFolder}/publish.sh"
             ],
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    "${workspaceFolder}/publish.ps1"
+                ]
+            },
             "group": {
                 "kind": "build",
                 "isDefault": true
