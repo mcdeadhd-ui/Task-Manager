@@ -4,13 +4,11 @@
   <strong>Browserbasierter Task-Manager mit Rollen, Kalender, Admin-Workflows und modernem Dashboard.</strong>
 </p>
 
-<p align="center">
-  ![Version](https://img.shields.io/badge/Version-1.0.0-blue)
-  ![Python](https://img.shields.io/badge/Python-3.12-3776AB)
-  ![Flask](https://img.shields.io/badge/Flask-3.x-000000)
-  ![SQLite](https://img.shields.io/badge/SQLite-3-003B57)
-  ![HTML/CSS/JS](https://img.shields.io/badge/HTML5-CSS3-JS-F16529)
-</p>
+![Version](https://img.shields.io/badge/Version-1.0.0-blue)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB)
+![Flask](https://img.shields.io/badge/Flask-3.x-000000)
+![SQLite](https://img.shields.io/badge/SQLite-3-003B57)
+![HTML/CSS/JS](https://img.shields.io/badge/HTML5-CSS3-JS-F16529)
 
 ## Ueberblick
 
